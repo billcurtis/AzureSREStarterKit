@@ -125,7 +125,7 @@ jobs:
           ORG_NAME: ${{ vars.ORG_NAME || github.repository_owner }}
         run: |
           # Extract optional ARG query hint from the issue body. The body is
-          # read from disk (jq) rather than via ${{ … }} interpolation, which
+          # read from disk (jq) rather than via workflow interpolation, which
           # avoids the GitHub-Actions templating step seeing user content
           # (and therefore avoids any shell-injection vector from authors).
           STATE_QUERY=$(jq -r '.body // ""' out/issue.json | grep -oP '(?<=ARG-QUERY:\s).+' | head -1 || true)
@@ -138,8 +138,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           ISSUE_NUMBER: ${{ github.event.issue.number || github.event.inputs.issue_number }}
-          ISSUE_TITLE: ${{ github.event.issue.title || format('Issue #{0}', github.event.inputs.issue_number) }}
         run: |
+          ISSUE_TITLE=$(jq -r '.title // ("Issue #" + (.number | tostring))' out/issue.json)
           BRANCH="triage/issue-${ISSUE_NUMBER}"
           DEFAULT_BRANCH=$(gh repo view --json defaultBranchRef --jq '.defaultBranchRef.name')
           git config user.name "sre-triage[bot]"
