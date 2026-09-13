@@ -1,3 +1,4 @@
+# This tracked copy enables Actions registration on repository forks.
 name: SRE Agent Auto Deploy
 
 on:

@@ -1,0 +1,193 @@
+# =============================================================================
+# Issue Triage → Draft PR
+#
+# Fires when an Azure-SRE-Agent-filed issue (or a manually-labeled issue)
+# is opened on this repo. Runs the triage agent, then opens a draft PR with
+# the proposed fix for human review.
+#
+# Required GitHub secrets (set under Settings → Secrets and variables → Actions):
+#   AZURE_CLIENT_ID                       — federated MI's client ID
+#   AZURE_TENANT_ID                       — your AAD tenant
+#   AZURE_SUBSCRIPTION_ID                 — subscription containing the resources
+#   AZURE_OPENAI_ENDPOINT                 — full https://….openai.azure.com URL
+#
+# Optional secrets:
+#   APPLICATIONINSIGHTS_CONNECTION_STRING — turns on OTel tracing
+#
+# Required GitHub repo setting:
+#   Settings → Actions → General → Workflow permissions →
+#     ☑ Allow GitHub Actions to create and approve pull requests
+#
+# Required federated identity credentials on AZURE_CLIENT_ID:
+#   For this workflow (triggered by `on: issues`), the OIDC subject is the
+#   default-branch ref of the repo, e.g.:
+#     subject: repo:OWNER/REPO:ref:refs/heads/main
+#   (substitute your actual default branch). Add additional subjects only if
+#   you change `on:` to include other trigger types.
+#   See ../docs/wif-setup.md for the full recipe.
+#
+# Required Azure role assignments on AZURE_CLIENT_ID's UAMI:
+#   - Cognitive Services OpenAI User    on the Azure OpenAI resource
+#   - Reader                            on the subscription (for ARG queries)
+#
+# ⚠️ Public-repo note: this workflow runs Azure OpenAI calls (which cost
+#   money) and creates PRs when an issue is labeled `sre-finding`. On a
+#   *public* repo any logged-in user can open an issue, and depending on
+#   automation/templates the label could be auto-applied. If you run this on
+#   a public repo, consider tightening the `if:` filter to also check
+#   `github.actor` (e.g. require the SRE Agent's bot identity) or a marker
+#   only the SRE Agent emits.
+# =============================================================================
+name: Issue Triage → Draft PR
+
+on:
+  issues:
+    types: [opened, labeled]
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: 'Existing issue number to triage'
+        required: true
+        type: string
+
+# Serialize per-issue: when the SRE Agent files an issue then attaches labels,
+# the workflow would otherwise fire multiple times in parallel and race on
+# git push. We let an in-progress run finish before starting the next one.
+concurrency:
+  group: triage-issue-${{ github.event.issue.number || github.event.inputs.issue_number }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+  id-token: write   # required for Azure Workload Identity Federation
+
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    # Only fire on issues carrying the sre-finding label (added by the SRE
+    # Agent, or manually applied for testing). This avoids running on every
+    # human-filed question. workflow_dispatch always runs.
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.issue.labels.*.name, 'sre-finding')
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install triage agent
+        run: |
+          # Copy the triage_agent package into the repo root so it's importable
+          # as `python -m triage_agent`. Adjust the source path if you put the
+          # starter kit somewhere other than alongside .github/.
+          if [ ! -d triage_agent ]; then
+            cp -R .github/triage_agent triage_agent
+          fi
+          pip install -r triage_agent/requirements.txt
+
+      - name: Azure login (Workload Identity Federation)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Persist issue payload to file
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # For issue-triggered runs: use the event's issue body directly.
+          # For workflow_dispatch runs: fetched via gh below.
+          ISSUE_JSON: ${{ toJSON(github.event.issue) }}
+          DISPATCH_ISSUE_NUMBER: ${{ github.event.inputs.issue_number }}
+        run: |
+          mkdir -p out
+          if [ -n "${DISPATCH_ISSUE_NUMBER:-}" ]; then
+            gh issue view "$DISPATCH_ISSUE_NUMBER" --json number,title,body,labels > out/issue.json
+          else
+            # Pass via env, never interpolate directly into run: (shell-injection safe).
+            printf '%s' "$ISSUE_JSON" > out/issue.json
+          fi
+
+      - name: Run triage agent
+        env:
+          AZURE_OPENAI_ENDPOINT: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          # Set TRIAGE_DEPLOYMENT to the *deployment name* you chose when you
+          # deployed the model in your Azure OpenAI resource. Common choices:
+          # gpt-4o, gpt-4o-mini, o3-mini, gpt-5-mini. NOT the bare model name.
+          TRIAGE_DEPLOYMENT: ${{ vars.TRIAGE_DEPLOYMENT || 'gpt-4o-mini' }}
+          APPLICATIONINSIGHTS_CONNECTION_STRING: ${{ secrets.APPLICATIONINSIGHTS_CONNECTION_STRING }}
+          ORG_NAME: ${{ vars.ORG_NAME || github.repository_owner }}
+        run: |
+          # Extract optional ARG query hint from the issue body. The body is
+          # read from disk (jq) rather than via ${{ … }} interpolation, which
+          # avoids the GitHub-Actions templating step seeing user content
+          # (and therefore avoids any shell-injection vector from authors).
+          STATE_QUERY=$(jq -r '.body // ""' out/issue.json | grep -oP '(?<=ARG-QUERY:\s).+' | head -1 || true)
+          python -m triage_agent \
+            --issue-file out/issue.json \
+            --out-dir out \
+            --state-query "${STATE_QUERY:-}"
+
+      - name: Open draft PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ github.event.issue.number || github.event.inputs.issue_number }}
+          ISSUE_TITLE: ${{ github.event.issue.title || format('Issue #{0}', github.event.inputs.issue_number) }}
+        run: |
+          BRANCH="triage/issue-${ISSUE_NUMBER}"
+          DEFAULT_BRANCH=$(gh repo view --json defaultBranchRef --jq '.defaultBranchRef.name')
+          git config user.name "sre-triage[bot]"
+          git config user.email "triage@example.com"
+          git checkout -b "$BRANCH"
+
+          # Copy any generated patch into the repo at its proposed path.
+          # The triage agent validates the path is under infra/, bicep/,
+          # terraform/, scripts/, or config/; double-check here as defence
+          # in depth before writing into the repo.
+          PATCH_FILE=$(jq -r '.fix.filename // empty' out/proposal.json)
+          case "$PATCH_FILE" in
+            ""|*..*|/*|.git/*|.github/*) PATCH_FILE="" ;;
+            infra/*|bicep/*|terraform/*|scripts/*|config/*) ;;
+            *) PATCH_FILE="" ;;
+          esac
+          if [ -n "$PATCH_FILE" ]; then
+            mkdir -p "$(dirname "$PATCH_FILE")"
+            cp "out/$(basename "$PATCH_FILE")" "$PATCH_FILE" 2>/dev/null || true
+            git add "$PATCH_FILE" || true
+          fi
+          # out/ is gitignored; force-add the audit artifact so reviewers can read it.
+          git add -f out/proposal.json
+          git commit -m "Triage agent proposal for #${ISSUE_NUMBER}" || echo "Nothing to commit"
+
+          git push -u origin "$BRANCH" --force-with-lease
+
+          # Use --title-file/--body-file to avoid shell-quoting issues with
+          # user-supplied issue titles (which may contain backticks, $(...), etc.).
+          printf '%s' "[Triage] ${ISSUE_TITLE}" > out/pr-title.txt
+          gh pr create \
+            --draft \
+            --title "$(cat out/pr-title.txt)" \
+            --body-file out/pr-body.md \
+            --base "$DEFAULT_BRANCH" \
+            --head "$BRANCH" \
+            --label "agent-proposal,needs-human-review" || {
+              echo "PR may already exist for this branch; updating..."
+              gh pr edit "$BRANCH" --body-file out/pr-body.md || true
+            }
+
+      - name: Link PR back to issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ github.event.issue.number || github.event.inputs.issue_number }}
+        run: |
+          PR_URL=$(gh pr list --head "triage/issue-${ISSUE_NUMBER}" --json url --jq '.[0].url' || echo "")
+          if [ -n "$PR_URL" ]; then
+            gh issue comment "$ISSUE_NUMBER" \
+              --body "🤖 Triage agent has proposed a fix in $PR_URL — please review and approve/reject."
+          fi

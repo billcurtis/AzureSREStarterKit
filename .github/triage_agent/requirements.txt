@@ -1,0 +1,5 @@
+openai>=1.50,<2
+azure-identity>=1.17,<2
+azure-mgmt-resourcegraph>=8.0,<9
+# Optional — only required if APPLICATIONINSIGHTS_CONNECTION_STRING is set.
+azure-monitor-opentelemetry>=1.6,<2
